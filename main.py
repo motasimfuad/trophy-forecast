@@ -70,8 +70,16 @@ def collapse(history, n):
     cur = [None] * n
     snaps = []
     key_prev = None
+    most = 0
     for read in history:
         rates = read.get("rates") or []
+        players = read.get("players_tracked")
+        if isinstance(players, (int, float)):
+            # a page with fewer players than one already seen is a stale cached copy:
+            # taking it would invent a refresh back and forth
+            if players < most:
+                continue
+            most = players
         for i in range(n):
             v = rates[i] if i < len(rates) else None
             if isinstance(v, (int, float)) and math.isfinite(v):
@@ -267,19 +275,37 @@ def forecast(case):
     if best is not None:
         damp = 0.5 * DAMP + 0.5 * best[1]
 
-    # Two cuts for the spread: a short one sees today's noise, a long one the curvature
-    # a line misses over a horizon closer to the forecast's. The larger scaled error is kept.
-    s_cal = None
+    # Two cuts for the spread. The 24h cut's horizon is closest to the forecast's, so it
+    # leads; the 12h cut's error, scaled up linearly, would count today's noise as slope
+    # error, so it only sets a lower bound at a discount.
+    s_by_cut = {}
     for cut in (12.0, 24.0):
         h = holdout(cut, damp)
         if h is None:
             continue
         mad, dx2 = h
-        s_here = 1.4826 * mad * (dx / dx2)
-        s_cal = s_here if s_cal is None else max(s_cal, s_here)
-    if s_cal is None:
+        s_by_cut[cut] = 1.4826 * mad * (dx / dx2)
+    if 24.0 in s_by_cut:
+        s_cal = max(s_by_cut[24.0], 0.6 * s_by_cut.get(12.0, 0.0))
+    elif 12.0 in s_by_cut:
+        s_cal = s_by_cut[12.0]
+    else:
         s_cal = 0.4 * dx / 0.9
     s_base = min(max(s_cal, 0.15 + 0.2 * dx), 0.9)
+
+    # An earned trophy stays earned, so a rate can fall only as fast as new players dilute
+    # it. A generous guess at the players-tracked growth to the target bounds every
+    # quantile from below.
+    pl = [(math.log(s[0]), math.log(s[1])) for s in use if s[0] >= t_last - WINDOW_HOURS and isinstance(s[1], (int, float)) and s[1] > 0]
+    g = 1.0
+    if len(pl) >= 2:
+        mx = sum(x for x, _ in pl) / len(pl)
+        my = sum(y for _, y in pl) / len(pl)
+        sxx = sum((x - mx) ** 2 for x, _ in pl)
+        if sxx > 1e-9:
+            g = sum((x - mx) * (y - my) for x, y in pl) / sxx
+    g = min(max(g, 0.0), 4.0)
+    dilution = math.exp((1.5 * g + 0.3) * dx)
 
     rows = []
     for i, t in enumerate(trophies):
@@ -306,10 +332,11 @@ def forecast(case):
             s += 0.12
         up = 1.15 if r_last < 10.0 else 1.0
         dn = 0.9 if r_last < 10.0 else 1.0
+        floor = r_last / dilution - 0.005
         qs = []
         for zq in ZL:
             k = up if zq > 0 else dn
-            qs.append(from_z(min(max(zm + zq * s * k, Z_FLOOR), Z_CEIL)))
+            qs.append(max(from_z(min(max(zm + zq * s * k, Z_FLOOR), Z_CEIL)), floor))
         rows.append({"id": t["id"], "q": finish(qs)})
     return rows
 
@@ -325,8 +352,12 @@ def main():
             rows = forecast(case)
         except Exception as exc:  # never leave a case without a valid forecast
             sys.stderr.write("%s: model failed (%r), persistence used\n" % (name, exc))
-            _, last = collapse(case.get("history") or [], len(case["trophies"]))
-            rows = persistence(case, last, 0.5 * math.sqrt(float(case.get("horizon_minutes", 0)) / 1440.0))
+            last = [None] * len(case["trophies"])
+            for read in case.get("history") or []:
+                for i, v in enumerate((read.get("rates") or [])[: len(last)]):
+                    if isinstance(v, (int, float)):
+                        last[i] = float(v)
+            rows = persistence(case, last, 0.8 + 0.5 * math.sqrt(float(case.get("horizon_minutes", 0)) / 1440.0))
         with open(os.path.join(out_dir, name[:-3] + ".out"), "w", encoding="utf-8") as fh:
             fh.write(json.dumps({"trophies": rows}, separators=(",", ":")) + "\n")
 
