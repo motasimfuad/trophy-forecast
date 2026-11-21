@@ -217,8 +217,10 @@ def forecast(case):
     dx = math.log(t_eff / t_last)
 
     # calibration: refit on the history cut earlier, score it on the latest refresh
+    # Two cuts: a short one sees today's noise, a long one the curvature a line misses
+    # over a horizon closer to the forecast's. The larger scaled error is kept.
     s_cal = None
-    for cut in (12.0, 18.0, 8.0):
+    for cut in (12.0, 24.0):
         early = [s for s in snaps if s[0] <= t_last - cut]
         m2 = fit(early, n)
         if m2 is None:
@@ -237,11 +239,11 @@ def forecast(case):
         if len(errs) >= 5:
             errs.sort()
             mad = errs[len(errs) // 2]
-            s_cal = 1.4826 * mad * (dx / dx2)
-            break
+            s_here = 1.4826 * mad * (dx / dx2)
+            s_cal = s_here if s_cal is None else max(s_cal, s_here)
     if s_cal is None:
-        s_cal = 0.35 * dx / 0.9
-    s_base = min(max(s_cal, 0.12 + 0.18 * dx), 0.9)
+        s_cal = 0.4 * dx / 0.9
+    s_base = min(max(s_cal, 0.15 + 0.2 * dx), 0.9)
 
     rows = []
     for i, t in enumerate(trophies):
@@ -253,10 +255,11 @@ def forecast(case):
             continue
         if r_last <= 0.0:
             # nobody tracked has it yet: it stays at the 0.01% floor unless it starts to move
-            z0 = to_z(0.003)
-            zm = z0 + 0.5 * max(pooled, 0.0) * DAMP * dx
-            s = s_base + 0.25
-            qs = [from_z(min(max(zm + zq * (s * (1.3 if zq > 0 else 0.6)), Z_FLOOR), Z_CEIL)) for zq in ZL]
+            # (the score clamps every rate to 0.01%, so lower tail below it costs nothing)
+            z0 = to_z(0.004)
+            zm = z0 + 0.25 * max(pooled, 0.0) * DAMP * dx
+            s = 0.3
+            qs = [from_z(min(max(zm + zq * (s * (1.3 if zq > 0 else 0.5)), Z_FLOOR), Z_CEIL)) for zq in ZL]
             rows.append({"id": t["id"], "q": finish(qs)})
             continue
         zm = z_last[i] + DAMP * slopes[i] * dx

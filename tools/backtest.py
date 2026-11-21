@@ -125,10 +125,13 @@ def synthetic_world(seed, slow=1.0, churn=0.0):
     the later weekdays' play, `churn` is the share of players who stop after a day."""
     rng = random.Random(seed)
     n_players = 6000
-    joins = [abs(rng.gauss(0, 1)) * 40.0 + rng.random() * 30.0 for _ in range(n_players)]
-    speed = [math.exp(rng.gauss(-0.9, 0.55)) for _ in range(n_players)]
+    # tracking grows all week (about a quarter of the week's players are tracked by hour 60),
+    # play speeds are low and wide, so most trophies sit under a few percent at hour 60,
+    # as on the real page
+    joins = [4.5 + 139.5 * rng.random() ** 0.6 for _ in range(n_players)]
+    speed = [math.exp(rng.gauss(math.log(0.08), rng.choice([0.7, 0.9, 1.1]))) for _ in range(n_players)]
     quits = [rng.random() < churn for _ in range(n_players)]
-    hours_needed = [0.0] + sorted(math.exp(rng.uniform(0.0, 4.2)) for _ in range(40))
+    hours_needed = [0.0] + sorted(math.exp(rng.uniform(math.log(0.3), math.log(60.0))) for _ in range(40))
     hours_needed += [1e9] * 4  # never earned in week one (100% completion and the like)
 
     def state(t):
