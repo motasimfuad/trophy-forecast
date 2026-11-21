@@ -23,6 +23,20 @@ How it works (`main.py`, Python standard library only, deterministic):
 `tools/backtest.py` re-implements the scorer (pinball loss on the logit scale), checks it on the rules' worked
 example, and scores `main.py` against the house persistence and curve baselines on synthetic launch weeks.
 
+## Backtest
+
+Mean pinball loss (logit scale, lower is better) on 11 synthetic launch weeks cut at hour 59.5 and scored at
+hour 144 (steady play, slowing play with churn, and play that nearly stops after day 3):
+
+| forecast | steady | slowing | stalling | all |
+| --- | --- | --- | --- | --- |
+| this entry | 0.405 | 0.379 | 0.420 | 0.400 |
+| house persistence baseline | 0.866 | 0.615 | 0.486 | 0.671 |
+| house curve baseline (re-implemented) | 0.864 | 0.803 | 0.969 | 0.870 |
+
+On the real practice cases (launch night, a 90-minute horizon over Exophase's first refresh) the server scored
+this entry 0.958 against 1.51 for both house baselines. The house model forecast cannot be backtested here.
+
 ## Run it
 
 ```sh
