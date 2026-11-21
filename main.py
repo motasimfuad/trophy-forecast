@@ -36,7 +36,7 @@ WINDOW_HOURS = 40.0      # fit on refreshes this recent
 DECAY_HOURS = 20.0       # recency weight of a refresh
 ROUND_SD = 0.01 / math.sqrt(12.0)  # the page rounds to 0.01 percentage points
 SLOPE_PRIOR_SD = 0.30    # between-trophy spread of probit slopes around the pooled one
-DAMP = 0.95              # mild hedge toward persistence
+DAMP = 0.75              # prior share of the fitted line's step growth keeps (slowing play, dilution)
 Z_FLOOR = -4.4           # probit of ~0.0005%
 Z_CEIL = 4.4
 
@@ -133,29 +133,46 @@ def fit(snaps, n):
         dof = max(len(xs) - 2, 1)
         sigma2 = max(resid / dof, 1.0)
         raw.append((a, b, sigma2 / sxx))
-    # pooled slope: precision-weighted mean of the well-measured trophies
-    num = den = 0.0
-    for r in raw:
+    last_rates = use[-1][2]
+    # Pooled slope as a line in the trophy's level: steady progress moves every trophy by
+    # the same probit step (flat line), while new players joining with nothing dilute
+    # every rate by the same factor, which in probit space moves rare trophies less.
+    # A precision-weighted fit of slope on level, ridged toward flat, lets the history
+    # say which dominates.
+    pts = []
+    for i, r in enumerate(raw):
         if r is None:
             continue
         _, b, vb = r
-        w = 1.0 / (vb + SLOPE_PRIOR_SD ** 2)
-        num += w * b
-        den += w
-    pooled = num / den if den > 0 else 0.0
-    last_rates = use[-1][2]
+        lv = min(max(to_z(last_rates[i]), -3.6), 1.5)
+        pts.append((lv, b, 1.0 / (vb + SLOPE_PRIOR_SD ** 2)))
+    pooled, tilt, lv0 = 0.0, 0.0, -1.5
+    if pts:
+        sw = sum(w for _, _, w in pts)
+        lv0 = sum(w * lv for lv, _, w in pts) / sw
+        pooled = sum(w * b for _, b, w in pts) / sw
+        sxx = sum(w * (lv - lv0) ** 2 for lv, _, w in pts)
+        sxy = sum(w * (lv - lv0) * (b - pooled) for lv, b, w in pts)
+        ridge = 2.0 * sw / 25.0  # as if 2 trophies' worth of evidence said "flat"
+        tilt = sxy / (sxx + ridge) if sxx + ridge > 0 else 0.0
+        tilt = min(max(tilt, -0.5), 0.5)
+
+    def prior_slope(i):
+        lv = min(max(to_z(last_rates[i] if last_rates[i] else 0.004), -3.6), 1.5)
+        return pooled + tilt * (lv - lv0)
+
     z_last, slopes = [], []
     for i in range(n):
         r_last = last_rates[i]
         r = raw[i]
         if r is None:
-            slopes.append(pooled * 0.5)
+            slopes.append(prior_slope(i) * 0.5)
             z_last.append(to_z(r_last if r_last is not None else 0.0))
             continue
         a, b, vb = r
         prec_own = 1.0 / vb
         prec_prior = 1.0 / SLOPE_PRIOR_SD ** 2
-        b_s = (prec_own * b + prec_prior * pooled) / (prec_own + prec_prior)
+        b_s = (prec_own * b + prec_prior * prior_slope(i)) / (prec_own + prec_prior)
         # level now: blend the observed last rate with the fitted line by their noise
         z_obs = to_z(r_last)
         z_fit = a + b * math.log(t_last)
@@ -216,31 +233,50 @@ def forecast(case):
     t_eff = max(target_h - gap / 2.0, t_last)
     dx = math.log(t_eff / t_last)
 
-    # calibration: refit on the history cut earlier, score it on the latest refresh
-    # Two cuts: a short one sees today's noise, a long one the curvature a line misses
-    # over a horizon closer to the forecast's. The larger scaled error is kept.
-    s_cal = None
-    for cut in (12.0, 24.0):
+    # Calibration: refit on the history cut earlier and score it on the latest refresh.
+    # The long cut also picks the damping: how much of the fitted line's step the
+    # history since the cut actually took (growth that slows shows up as a step short
+    # of the line), shrunk toward DAMP since one holdout is a small sample.
+    def holdout(cut, damp):
         early = [s for s in snaps if s[0] <= t_last - cut]
         m2 = fit(early, n)
         if m2 is None:
-            continue
+            return None
         t2, z2, b2, _ = m2
         dx2 = math.log(t_last / t2)
         if dx2 <= 0.02:
-            continue
+            return None
         errs = []
         for i in range(n):
             r = use[-1][2][i]
             if r is None or r < 0.05 or r > 99.9:
                 continue
-            pred = z2[i] + DAMP * b2[i] * dx2
-            errs.append(abs(to_z(r) - pred))
-        if len(errs) >= 5:
-            errs.sort()
-            mad = errs[len(errs) // 2]
-            s_here = 1.4826 * mad * (dx / dx2)
-            s_cal = s_here if s_cal is None else max(s_cal, s_here)
+            errs.append(abs(to_z(r) - (z2[i] + damp * b2[i] * dx2)))
+        if len(errs) < 5:
+            return None
+        errs.sort()
+        return errs[len(errs) // 2], dx2
+
+    damp = DAMP
+    best = None
+    for k in range(4, 13):
+        d = k / 10.0
+        h = holdout(24.0, d)
+        if h is not None and (best is None or h[0] < best[0]):
+            best = (h[0], d)
+    if best is not None:
+        damp = 0.5 * DAMP + 0.5 * best[1]
+
+    # Two cuts for the spread: a short one sees today's noise, a long one the curvature
+    # a line misses over a horizon closer to the forecast's. The larger scaled error is kept.
+    s_cal = None
+    for cut in (12.0, 24.0):
+        h = holdout(cut, damp)
+        if h is None:
+            continue
+        mad, dx2 = h
+        s_here = 1.4826 * mad * (dx / dx2)
+        s_cal = s_here if s_cal is None else max(s_cal, s_here)
     if s_cal is None:
         s_cal = 0.4 * dx / 0.9
     s_base = min(max(s_cal, 0.15 + 0.2 * dx), 0.9)
@@ -257,13 +293,17 @@ def forecast(case):
             # nobody tracked has it yet: it stays at the 0.01% floor unless it starts to move
             # (the score clamps every rate to 0.01%, so lower tail below it costs nothing)
             z0 = to_z(0.004)
-            zm = z0 + 0.25 * max(pooled, 0.0) * DAMP * dx
+            zm = z0 + 0.25 * max(pooled, 0.0) * damp * dx
             s = 0.3
             qs = [from_z(min(max(zm + zq * (s * (1.3 if zq > 0 else 0.5)), Z_FLOOR), Z_CEIL)) for zq in ZL]
             rows.append({"id": t["id"], "q": finish(qs)})
             continue
-        zm = z_last[i] + DAMP * slopes[i] * dx
+        zm = z_last[i] + damp * slopes[i] * dx
         s = math.sqrt(s_base ** 2 + z_noise(r_last) ** 2)
+        if r_last < 0.1:
+            # a trophy held by a handful of players: whether the bulk of players reaches it
+            # this week is far less certain than its few holders' pace says
+            s += 0.12
         up = 1.15 if r_last < 10.0 else 1.0
         dn = 0.9 if r_last < 10.0 else 1.0
         qs = []
