@@ -171,6 +171,10 @@ def persistence(case, last, spread):
     rows = []
     for t, r in zip(case["trophies"], last):
         r = 0.0 if r is None else r
+        if r >= 99.995:
+            # the first trophy every tracked player holds stays at 100%
+            rows.append({"id": t["id"], "q": [100.0] * 5})
+            continue
         rows.append({"id": t["id"], "q": quantiles_from_logit(r, spread)})
     return rows
 
